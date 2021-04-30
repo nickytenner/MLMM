@@ -1,0 +1,784 @@
+from .machine import *
+from qml.representations import *
+from qml.fchl import generate_representation,get_local_kernels,get_local_symmetric_kernels
+from itertools import islice
+from mendeleev import element as elx
+import pandas as pd
+
+def chunk(it, size):
+    it = iter(it)
+    return iter(lambda: tuple(islice(it,size)),())
+
+def count_lines(fname):
+    n=0
+    with open(fname) as f:
+        while True:
+            buf = f.readline()
+            if not buf:break
+            n+=1
+    return n
+
+def count_comp_frame(fname):
+    n=0
+    with open(fname) as f:
+        while True:
+            buf = f.readline()
+            if not buf: break
+            n +=1
+    return int(n/9)
+
+def count_traj_frame(fname,tralen,fy):
+    n = 0
+    with open(fname) as fx:
+        while True:
+            buf =fx.readline()
+            if not buf: break
+            n += 1
+            for i in range(tralen-1):
+                fx.readline()
+    m = 0
+    with open(fy) as f:
+        while True:
+            buf = f.readline()
+            if not buf: break
+            m += 1
+    tralen_before = tralen/2
+    tralen_after = tralen/2
+    with open(fname) as fx:
+        for i in range(m):
+            tra_before = tralen/2
+            tra_after = tralen/2
+            [step,x,y,z,vx,vy,vz]=fx.readline().split()
+            p_impact = [float(x),float(y),float(z)]
+            for j in range(1,tralen):
+                [step,x,y,z,vx,vy,vz]=fx.readline().split()
+                xyz = [float(x),float(y),float(z)]
+                if xyz[1] < p_impact[1]:
+                    p_impact = xyz
+                    tra_before = j+1
+            tra_after = tralen - tra_before
+            if tra_before < tralen_before:
+                tralen_before = tra_before
+                frame_before = i+1
+            if tra_after < tralen_after:
+                tralen_after = tra_after
+                frame_after = i+1
+    print ("Impact analysis:")
+    print ("Lowest number of positions before impact:%d (frame:%d)"%(tralen_before,frame_before))
+    print ("Lowest number of poistions after impact:%d (frame:%d)"%(tralen_after,frame_after))
+    #print (tralen_before,tralen_after)
+    return n,m            
+
+def count_frame(fname):
+    n = 0
+    size=0
+    with open(fname) as f:
+        while True:
+            buf = f.readline()
+            if not buf:break
+            natom = int(buf)
+            if size < natom: size = natom
+            f.readline()
+            n +=1
+            for i in range(natom):
+                f.readline()
+    return n,size
+    
+def get_parent(Z):
+    """
+    Takes an atomic number of an element and returns the atomic number of the topmost element in the group.
+
+    NOTE: Only works for atomic numbers between 1-54
+    Args:
+        Z (int): atomic number of the "child" element.
+
+    Returns:
+        int: atomic number of the "parent" element.
+
+    """
+    group_id = elx(Z).group_id
+    period = elx(Z).period
+    block = elx(Z).block
+    if group_id == 18:
+        parent_z = 2
+    elif group_id == 2:
+        parent_z = 4
+    elif block == 'p':
+        parent_z = group_id - 8
+    elif block == 'd':
+        parent_z = group_id + 18 
+    else:
+        parent_z = 1
+        
+    if block == 's':
+        row = period - 1
+    elif block == 'p':
+        row = period - 2
+    elif block == 'd':
+        row = period - 4
+    elif block == 'f':
+        print ("ERROR: F-block elements are not implemented in pcm")
+        quit()
+    return(parent_z,row)
+    #if Z <= 10:
+    #    return Z
+    #if Z <= 20:
+    #    return (Z-8)
+    #if Z >= 21 and  Z <= 30:
+    #    return Z
+    #if Z >= 31 and Z <= 38:
+    #    return get_parent(Z-18)
+    #if Z >=39 and Z <=54:
+    #    return get_parent(Z-18)
+
+def get_modified_z(atoms,zeta):
+    mod_z = {}
+    for elem in atoms:
+        parent,n = get_parent(elem)
+        mod_z[elem] = parent * (1+zeta*n)
+    return mod_z
+    
+def compute_matrix(Z, X, zeta = 0.0):
+    """Generates a Modified Coulomb Matrix with diagonal elements identical to the Standard Coulomb Matrix but non-diagonal elements using
+                                                        Z = Z_parent(1+n*zeta)
+    where n is the number of rows from the parent element (f.ex. n =1 for Si, n=2 for Se) and zeta is a user-defined hyperparam (set to off by default).
+
+    Parameters
+    ----------
+    Z : list-type(string)
+        List of atomic symbols.
+    X : matrix-type(float)
+        List of co-ordinates in xyz for each element.
+    zeta : float
+        Tweaking parameter to optimize representation accuracy.
+
+    Returns
+    -------
+    matrix-type
+        A modified coulomb matrix.
+    """
+    Z = np.array(Z)
+    X = np.array(X)
+    MCM = np.zeros((len(Z),len(Z)))
+
+    # Create two Z vectors from the acquired list of symbols. Zm contains the modified element list which will
+    # be used to compute the off-diagonal elements only.
+    Zm = [get_parent( (elx(x).atomic_number) )*(1+ zeta*(elx(x).period -2) ) if x != 'H' else 1.0 for x in Z]
+    Z = [float(elx(x).atomic_number) for x in Z]
+
+    ## Use this line to debug the Zm creation process
+    #print(f"Zm = {Zm}\nZ= {Z}")
+
+    for i in range(len(Z)):
+        for j in range(len(Z)):
+            if i == j:
+                MCM[i][j] = 0.5*Z[i]**0.24
+            else:
+                MCM[i][j] = Zm[i] * Zm[j] /np.linalg.norm(X[i] - X[j])
+    return MCM
+
+# Generates a Periodic Table- compatible CM
+def gen_pcm(Z,X, zeta = 0.0, size =34, sorting = "row-norm"):
+    """Calls compute_matrix to compute a matrix, then performs sorting and padding according to user specifications.
+
+    Parameters
+    ----------
+    Z : list-type(string)
+        List of atomic symbols.
+    X : matrix-type(float)
+        List of co-ordinates in xyz for each element.
+    zeta : float
+        Tweaking parameter to optimize representation accuracy.
+    size : int
+        Maximum size of the molecule (the default is 34).
+
+    Returns
+    -------
+    matrix-type
+        A modified coulomb matrix with padding and sorting (if specified).
+    """
+
+    Z = np.array(Z)
+    X = np.array(X)
+
+    MCM = compute_matrix(Z,X,zeta = zeta)
+
+    # Sort Z and X according to L2 norm of each row and recompute matrix
+    if sorting == "row-norm":
+        summation = np.array([sum(x**2) for x in MCM])
+        Z = Z[np.argsort(summation)[::-1]]
+        X = X[np.argsort(summation)[::-1,],:]
+
+        ## Use this line to debug the sorting process
+        #print(f"Z_sorted = {Z}")
+        MCM = compute_matrix(Z,X,zeta = zeta)
+
+    # Flatten the matrix by creating a list of its upper triangular elements, then add padding
+    # of zeroes to return a list of length = (size/2)*(size + 1).
+    MCM = MCM[np.triu_indices(np.shape(MCM)[0])]
+    surplus = int(size*(size+1)/2 - len(MCM))
+    MCM = np.pad(array = MCM, pad_width=(0,surplus) , mode = 'constant', constant_values = 0)
+    return MCM
+def generate_pcm(mod_nuc,nuc,xyz,size=0,sorting="row-norm"):
+    natom = len(nuc)
+    cm_shape = int(((size+1)*size)/2)
+    #print(size,cm_shape,natom)
+    pair_dist_mat = np.zeros((natom,natom))
+    row_norm = np.zeros((natom))
+    cm = np.zeros(cm_shape)
+    for i,val in enumerate(nuc):
+        pair_norm = 0.5*val**2.4
+        pair_dist_mat[i,i] = pair_norm
+        row_norm[i] = row_norm[i] + pair_norm*pair_norm 
+    for i,z1 in enumerate(mod_nuc):
+        xyz1 = xyz[i]
+        for j in range(i+1,len(mod_nuc)):
+            z2 = mod_nuc[j]
+            xyz2 = xyz[j]
+            pair_norm = z1*z2/(np.sqrt(np.sum([(x-y)**2.0 for x,y in zip(xyz1,xyz2)])))
+            pair_dist_mat[i,j] = pair_norm
+            pair_dist_mat[j,i] = pair_norm
+            pair_norm = pair_norm*pair_norm
+            row_norm[i] = row_norm[i]+pair_norm
+            row_norm[j] = row_norm[j]+pair_norm
+    sorted_atom_indices = np.argsort(row_norm*-1)
+    #print(pair_dist_mat)
+    for m,i in enumerate(sorted_atom_indices):
+        idx = int((m*m+m)/2-m)
+        for n,j in enumerate(sorted_atom_indices):
+            cm[idx+n] = pair_dist_mat[i,j]
+    return cm    
+
+#locCM= getOCM(xyz,vel,self.atomic_number,self.rep,self.tramin)
+def getOCM(xyz,vel,nuc,rep,tramin): #Coulmob measure between trajectory and point of impact
+    p_impact = xyz[0]
+    #stat = True
+    for i in range(len(xyz)):
+        if xyz[i][1] < p_impact[1]:
+            p_impact = xyz[i]
+            impact = i
+    if impact < tramin or len(xyz)-impact < tramin+1:
+        raise Exception('Impact is too close to the trajectory boundary')
+    else:
+        xyz1 = xyz[impact-tramin:impact+tramin+1]
+        vel1 = vel[impact-tramin:impact+tramin+1]
+        locX = []
+        locV = []
+        a = np.array(p_impact)
+        for p,v in zip(xyz1,vel1):
+            b = np.array(p)
+            dist = np.linalg.norm(a-b)
+            locV.append(np.linalg.norm(v))
+            #locV.append((np.array(v)**2).sum())
+            if dist !=0:
+                if nuc[0] == nuc[1]:
+                    locX.append(nuc[0]**2.4/dist)
+                else:
+                    locX.append(nuc[0]*nuc[1]/dist)
+    locX = list(np.array(locX)-locX[-1])
+    #locV = list(np.array(locV)-locV[-1])
+    if rep == 'wvcm':
+        return locX+locV
+    elif rep == 'wcm':
+        return locX
+    elif rep == 'wvel':
+        return locV
+    #print (locX+locV)
+    #quit()
+def count_lines(file):
+    n = 0
+    with open(file) as f:
+        while True:
+            buf = f.readline()
+            if not buf:
+                break
+            n = n+1
+    return n
+    
+class VelocityData(object):
+    def __init__(self,fxyz,frames=None):
+        self.xfile = fxyz
+        self.frames = frames
+        self.update()
+    def update(self):
+        self.nframe = count_lines(self.xfile)
+        if self.frames is None:
+            self.frames = [1,self.nframe]
+        assert self.frames[1]<=self.nframe
+    def getRep(self,*args,**kwargs):
+        kw = {}
+        kw.update(kwargs)
+        self.rep = kw.get('rep','2norm')
+        self.nuc = kw.get('nuc',None)
+        print("Generating Representation")
+        bar = pyprind.ProgBar(self.frames[1]-self.frames[0],bar_char='#')
+        X = []
+        y = []
+        with open(self.xfile) as fx:
+            for i in range(self.frames[1]):
+                v = fx.readline().split()
+                try:
+                    v = [float(elem) for elem in v]
+                    if len(v) != 6:
+                        print ("ERROR: Expecting data with six columns only")
+                        quit()
+                    u = v[:3] 
+                    v = v[3:]
+                    if self.rep == 'ColVel1norm':
+                        X.append([np.linalg.norm(u,1)])
+                        y.append(np.linalg.norm(v,1))
+                    elif self.rep == 'vel2norm':
+                        X.append([np.linalg.norm(u,2)**2, np.linalg.norm(v,2)**2])
+                        y.append(0)
+                    elif self.rep == 'ColVelu':
+                        X.append([u[0]])
+                        y.append(v[0])
+                    elif self.rep == 'ColVelv':
+                        X.append([u[1]])
+                        y.append(v[1])
+                    elif self.rep == 'ColVelw':
+                        X.append([u[2]])
+                        y.append(v[2])
+                    else:
+                        print("ERROR: Unknown representation type:",(self.rep))
+                        quit()
+                except:
+                    print ("Not a float")
+                bar.update()
+        #print (len(X),len(y))
+        self.X=np.array(X)
+        self.y=np.array(y)
+        #print (self.y)
+
+class EACTrajectory(object):
+    def __init__(self,fxyz,fy,traj_length,frames=None):
+        self.xfile = fxyz
+        self.yfile = fy
+        self.tralen=traj_length
+        self.frames = frames
+        assert self.tralen != 0
+        self.update()
+    def update(self):
+        self.nframe = count_traj_frame (self.xfile,self.tralen,self.yfile)        
+        if self.nframe[0] != self.nframe[1]:
+            print("WARNING: Mismatch in total number of entries in trajectory file (%d) and target value file (%d)"%(self.nframe[0],self.nframe[1]))
+        else:
+            if self.frames is None:
+                self.frames = [1,self.nframe[0]]
+        assert self.frames is not None
+        assert self.frames[1] <= self.nframe[0] and self.frames[1] <= self.nframe[1]
+    def getRep(self,*args,**kwargs):
+        kw = {}
+        kw.update(kwargs)
+        self.rep = kw.get('rep','wvcm')
+        self.atomic_list = kw.get('nuc',['Ar','Pt'])
+        self.tramin = kw.get('tramin',10)
+        self.atomic_number = [float(getattr(el,a).number) for a in self.atomic_list]
+        self.X=[]
+        self.y=[]
+        nreject = 0
+        print("Generating Representation")
+        bar = pyprind.ProgBar(self.frames[1]-self.frames[0],bar_char='#')
+        with open(self.xfile) as fx, open(self.yfile) as fy:
+            for i in range(self.frames[1]):
+                xyz = []
+                vel = []
+                [step,eac] = fy.readline().split()
+                for j in range(self.tralen):
+                    [step,x,y,z,vx,vy,vz] = fx.readline().split()
+                    if i >= self.frames[0]:
+                        eac = float(eac)
+                        xyz.append([float(x),float(y),float(z)])
+                        vel.append([float(vx),float(vy),float(vz)])
+                if i >= self.frames[0]:
+                    try:
+                        self.X.append(getOCM(xyz,vel,self.atomic_number,self.rep,self.tramin))
+                        #if len(self.X[-1]) !=101:
+                        #    print("error %d"%len(self.X[-1]))
+                        #    quit()
+                        self.y.append(float(eac))
+                    except:
+                        nreject +=1
+                bar.update()
+        self.X=np.array(self.X)
+        self.y=np.array(self.y)
+        print("Representation Analysis:")
+        print("Total number of trajectories scanned:%d"%(self.frames[1]-self.frames[0]))
+        print("Number of trajectories rejected:%d"%nreject)
+        print("Remaining number of trajectores and target values for regression:%d %d"%(len(self.X),len(self.y)))        
+        
+class CompositeList(object):
+    def __init__(self,fxyz,frames=None):
+        self.xfile = fxyz
+        self.frames = frames
+        self.rep = ''
+        self.update()
+    def update(self):
+        self.nframe = count_comp_frame(self.xfile)
+        if self.frames is None:
+            self.frames = [1,self.nframe]
+        #print (self.nframe)
+    def getRep(self,*args,**kwargs):
+        self.X=[]
+        self.y=[]
+        #self.numberoflayers = 0
+        with open (self.xfile) as f:
+            while True:
+                ABD = []
+                buf = f.readline().split()
+                if not buf: break
+                layers = [float(elem) for elem in buf]
+                self.numberoflayers = len(layers)
+                for i in range(6):
+                    line=f.readline().split()
+                    line = [float(elem) for elem in line]
+                    ABD.append(line)
+                eig_val = f.readline().split()
+                eig_val = [float(elem) for elem in eig_val]
+                f.readline()
+                self.X.append(layers)
+                self.y.append(eig_val)
+        self.X = np.array(self.X)
+        self.y = np.array(self.y)
+        #print (self.X.shape,self.y.shape)
+        #quit()
+                #print(layers, ABD, eig_val)
+                #print(layers)
+                #quit
+        
+
+class StructureList(object):
+    def __init__(self,fxyz,fy,frames=None):
+        self.xfile = fxyz
+        self.yfile = fy
+        self.frames = frames
+        self.rep = None
+        self.datafile = None
+        self.update()
+    def update(self):
+        self.nframe,self.max_size = count_frame(self.xfile)
+        self.ny = count_lines(self.yfile)
+        if (self.nframe != self.ny):
+            print("WARNING: Mismatch in number of entries in data files %d %d" % (self.nframe,self.ny))
+            print("Continuing...")
+            #quit()
+        if not self.frames:
+            self.frames = [0,self.nframe]
+    def get_asize(self):
+        atype = []
+        frame_number = 0
+        with open(self.xfile) as fx:
+            while True:
+                buf = fx.readline()
+                if not buf: break
+                natom = int(buf)
+                fx.readline()                
+                if self.frames[0] <= frame_number < self.frames[1]:
+                    for i in range(natom):
+                        line = fx.readline()
+                        axyz = line.split()
+                        if axyz[0] not in atype:
+                            atype.append(axyz[0])
+                elif frame_number >= self.frames[1]:
+                    break
+                else:
+                    for i in range(natom):
+                        fx.readline()
+                frame_number += 1
+        asize = {el:0 for el in atype}
+        frame_number = 0
+        with open(self.xfile) as fx:
+            while True:
+                buf = fx.readline()
+                if not buf: break
+                natom = int(buf)
+                fx.readline()
+                atoms = []                
+                if self.frames[0]<=frame_number < self.frames[1]:
+                    for i in range(natom):
+                        line = fx.readline()
+                        axyz = line.split()
+                        atoms.append(axyz[0])
+                elif frame_number >= self.frames[1]:
+                    break
+                else:
+                    for i in range(natom):
+                        fx.readline()
+                asize_tmp = Counter(atoms)
+                for key in set(asize.keys()) & set(asize_tmp.keys()):
+                    if asize_tmp[key] > asize[key]:
+                        asize[key] = asize_tmp[key]
+                frame_number +=1
+        print("List of elements with max count:",asize)
+        return asize                        
+    def getRep(self,*args,**kwargs):
+        kw = {}
+        kw.update(kwargs)
+        self.rep = kw.get('rep','cm')
+        self.sort = kw.get('sort',"row-norm")
+        self.size = int(kw.get('size',self.max_size))
+        self.asize = kw.get('asize',None)
+        self.dsigma2 = kw.get('dsigma2',2.**-4)
+        self.dsigma3 = kw.get('dsigma3',None)
+        self.basis = kw.get('basis',None)
+        self.flatten = kw.get('flatten',True)
+        self.zeta = kw.get('zeta',0.0)
+        self.stats = None
+        self.X=[]
+        self.y=[]
+        self.data = None
+        self.mod_z = None
+        self.mbtr_z = []
+        self.mbtr_r = []
+        self.mbtr_repr = []
+        #self.mbtr_reprf2 = None
+        #self.mbtr_reprf3 = None
+        frame_counter = 0
+        if self.rep in ['bob','mbtr','mbtr3','pcm','ppcm','pmbtr']:
+        #if self.rep == 'bob' or self.rep == 'mbtr' or self.rep == 'mbtr3' or self.rep=='pcm' or self.rep=='ppcm' or self.rep=='pmbtr':
+            if self.asize == None:
+                self.asize = self.get_asize()
+            if self.rep in ['mbtr','mbtr3','pmbtr']:
+                self.atomic_list = [getattr(el,a).number for a in self.asize.keys()]
+            if self.rep in ['pcm','ppcm','pmbtr']:
+                self.mod_z = get_modified_z(self.asize.keys(),self.zeta)
+                print ("Modified atomic numbers")
+                print (self.mod_z)
+        print("Generating representations")
+        bar = pyprind.ProgBar(self.frames[1]-self.frames[0],bar_char='#')
+        with open (self.xfile) as fx,open(self.yfile) as fy:
+            while True:
+                buf = fx.readline()
+                if not buf: break
+                natom = int(buf)
+                fx.readline()
+                xyz = []
+                nuc = []
+                atom = []
+                for i in range(natom):
+                    line = fx.readline()
+                    axyz = line.split()
+                    [a,x,y,z] = [axyz[0],axyz[1],axyz[2],axyz[3]]
+                    nuc.append(float(getattr(el,a).number))
+                    atom.append(getattr(el,a).symbol)
+                    xyz.append([float(x),float(y),float(z)])
+                coordinates = np.array(xyz)
+                nuclear_charges = np.array(nuc)
+                if self.frames[0] <= frame_counter < self.frames[1]:
+                    if self.rep in ['mbtr','mbtr3','pmbtr']:
+                        if self.rep == 'pmbtr':
+                            mod_nuc = [self.mod_z[elem] for elem in atom]
+                            self.mbtr_z.append(mod_nuc)
+                        else:
+                            self.mbtr_z.append(nuc)
+                        self.mbtr_r.append(xyz)
+                    else:
+                        self.X.append(getQmlRep(rep=self.rep,atom=atom,nuc=nuclear_charges, xyz=coordinates,size=self.size,asize=self.asize,sorting=self.sort,mod_z=self.mod_z))
+                    self.y.append(float(fy.readline()))
+                elif frame_counter >= self.frames[1]:
+                    break
+                else:
+                    pass
+                frame_counter += 1
+                bar.update()
+        if self.rep in ['mbtr','mbtr3','pmbtr']:
+            print("Generating MBTR...")
+            self.mbtr_z = np.asarray(self.mbtr_z)
+            self.mbtr_r = np.asarray(self.mbtr_r)
+        if self.rep=='mbtr':            
+            self.X = qmml.many_body_tensor(
+                self.mbtr_z,self.mbtr_r,
+                (0.1,1.1/100,100),
+                (2,'1/distance','identity^2',('normal',(self.dsigma2,)),
+                 'identity','noreversals','noreversals'),
+                acc=0.001,elems=self.atomic_list,flatten=self.flatten
+                )
+            self.y = np.asfarray(self.y)
+        elif self.rep in ['mbtr3','pmbtr']:
+            zlen = len(self.mbtr_z)
+            assert len(self.mbtr_z)==len(self.mbtr_r)
+            assert zlen > 2000
+            mbtr_zl = np.asarray(list(chunk (self.mbtr_z,1000)))
+            mbtr_rl = np.asarray(list(chunk (self.mbtr_r,1000)))
+            repr = []
+            bar = pyprind.ProgBar(len(mbtr_zl),bar_char='#')
+            for z,r in zip(mbtr_zl,mbtr_rl):
+                reprf2=qmml.many_body_tensor(z,r,(0.1,1.1/100,100),(2,'1/distance','identity^2',('normal',(self.dsigma2,)),'identity','noreversals','noreversals'),basis=self.basis,acc=0.001,elems = self.atomic_list,flatten = self.flatten)
+                reprf3=qmml.many_body_tensor(z,r,(-0.15,3.45575/100,100),(3,'angle','1/dotdotdot',('normal',(self.dsigma3,)),'identity','noreversals','noreversals'),basis=self.basis,acc=0.001,elems=self.atomic_list,flatten=self.flatten)
+                repr.append(np.array([list(elem1)+list(elem2) for elem1,elem2 in zip(reprf2,reprf3)]))
+                bar.update()
+            #print (repr[0][10],len(repr))
+            for elem in repr:
+                self.mbtr_repr += list(elem)
+            self.X = np.array(self.mbtr_repr)
+            self.y = np.asfarray(self.y)
+            
+            #print (len(self.X),len(self.y))
+            #quit()
+            #self.mbtr_reprf2 = qmml.many_body_tensor(
+            #    self.mbtr_z,self.mbtr_r,
+            #    (0.1,1.1/100,100),
+            #    (2,'1/distance','identity^2',('normal',(self.dsigma2,)),
+            #     'identity','noreversals','noreversals'),
+            #    basis=self.basis,acc=0.001,elems = self.atomic_list,flatten = self.flatten
+            #    )
+            #self.mbtr_reprf3 = qmml.many_body_tensor(
+            #    self.mbtr_z,self.mbtr_r,
+            #    (-0.15,3.45575/100,100),
+            #    (3,'angle','1/dotdotdot',('normal',(self.dsigma3,)),
+            #     'identity','noreversals','noreversals'),
+            #    basis=self.basis,acc=0.001,elems = self.atomic_list,flatten = self.flatten
+            #    )
+            #self.X = np.array([list(elem1)+list(elem2) for elem1,elem2 in zip(self.mbtr_reprf2,self.mbtr_reprf3)])
+            #self.y = np.asfarray(self.y)
+        else:
+            self.X = np.array(self.X)
+            self.y = np.array(self.y)
+        self.data = np.zeros((np.shape(self.X)[0],np.shape(self.X)[1]+1))
+        self.data[:,:-1] = self.X
+        self.data[:,-1] = self.y
+    def cleanup(self):
+        print ("Analysing data...")
+        data = pd.DataFrame(self.X)
+        self.stats = data.describe().transpose()
+        std = self.stats['std']
+        features = data.keys()
+        print ("Cleaning data...")
+        bar = pyprind.ProgBar(len(features),bar_char='#')
+        for feat,sig in zip(features,std):
+            if sig == 0.0:
+                check = data.pop(feat)
+                if np.count_nonzero(np.array(check)) > 0:
+                    print("ERROR: Deleting valuable features\nCleaning is going wrong!!")
+                    quit()
+            bar.update()
+        f1 = np.shape(self.X)[1]
+        print ("Shape of input before cleaning:",np.shape(self.X))
+        self.X = np.array(data)
+        f2 = np.shape(self.X)[1]
+        print ("Shape of input after cleaning:",np.shape(self.X))
+        print ("Number of redundant features removed: %d"%(f1-f2))
+        self.data = np.zeros((np.shape(self.X)[0],np.shape(self.X)[1]+1))
+        self.data[:,:-1] = self.X
+        self.data[:,-1] = self.y
+    def normalize(self):
+        print ("Normalizing data..")
+        if self.stats == None:
+            data = pd.DataFrame(self.X)
+            self.stats = data.describe().transpose()
+        X = (self.X-self.stats['mean'])/self.stats['std']
+        self.X = X
+    def getLocRep(self,axyz=None):
+        nuc = []
+        coord = []
+        self.lX = []
+        if axyz == None:
+            print ("ERROR: empty molecule")
+            quit()
+        natom = len(axyz)
+        for elem in axyz:
+            nuc.append(float(getattr(el,elem[0]).number))
+            coord.append([float(elem[1]),float(elem[2]),float(elem[3])])
+        if self.rep == 'bob' or self.rep == 'cm' or self.rep == 'fchl':
+            self.lX=getQmlRep(rep=self.rep,nuc=nuc, xyz=coord,size=self.size,asize=self.asize,sorting=self.sort)
+        elif self.rep == 'mbtr':
+            self.lX.append(qmml.many_body_tensor(
+                [nuc],[coord],
+                (0.1,1.1/100,100),
+                (2,'1/distance','identity^2',('normal',(self.dsigma2,)),
+                 'identity','noreversals','noreversals'),
+                acc=0.001,elems = self.atomic_list,flatten = self.flatten
+                ))
+        elif self.rep == 'mbtr3':
+            self.lX1 = qmml.many_body_tensor(
+                [nuc],[coord],
+                (0.1,1.1/100,100),
+                (2,'1/distance','identity^2',('normal',(self.dsigma2,)),
+                 'identity','noreversals','noreversals'),
+                basis=self.basis,acc=0.001,elems = self.atomic_list,flatten = self.flatten
+                )
+            self.lX2 = qmml.many_body_tensor(
+                [nuc],[coord],
+                (-0.15,3.45575/100,100),
+                (3,'angle','1/dotdotdot',('normal',(self.dsigma3,)),
+                 'identity','noreversals','noreversals'),
+                basis=self.basis,acc=0.001,elems = self.atomic_list,flatten = self.flatten
+                )
+            self.lX=np.array([list(elem1)+list(elem2) for elem1,elem2 in zip(self.lX1,self.lX2)])
+        else:
+            print("ERROR: Unknown representation type. It may not have been implemented yet")
+            quit()
+    def writedata (self,fname):
+        if self.data is not None:
+            data = pd.DataFrame(self.data)
+            data.to_csv(fname,encoding='utf-8',sep=" ",index=False)
+        else:
+            print("ERROR: Empty data.. Nothing to write..!!")
+            quit()
+    def readdata(self,fname):
+        try:
+            print("Reading data from %s"%fname)
+            data = pd.read_csv(fname,sep=" ")
+        except:
+            print("ERROR: Unable to open file %s\n"%fname)
+            quit()
+        self.data = np.array(data)
+        ylabel = data.keys()[-1]
+        y = data.pop(ylabel)
+        self.X = np.array(data)
+        self.y = np.array(y)
+        self.datafile = fname
+        self.conf = np.shape(self.X)
+        self.rep = fname[:-4]
+
+def getQmlRep(*args,**kwargs):
+    kw = {}
+    kw.update(kwargs)
+    rep = kw.get('rep','cm')
+    nuc = kw.get('nuc',np.array([8,1,1]))
+    atom = kw.get('atom',None)
+    xyz = kw.get('xyz',np.array([[1.464, 0.707,1.056],[0.878,1.218,0.498],[2.319,1.126,0.952]]))
+    size = kw.get('size',23)
+    sort = kw.get('sorting',"row-norm")
+    neighbors = size
+    asize = kw.get('asize',{"O":1,"H":2})
+    z_max = kw.get('Zmax',0.0)
+    mod_z = kw.get('mod_z',None)
+    
+    X = None
+    if rep == 'cm':
+        X = generate_coulomb_matrix(nuc,xyz,size=size,sorting=sort)
+    elif rep == 'bob':
+        if asize == None:
+            print('ERROR: asize in not specified')
+            quit()
+        X = generate_bob(nuc,xyz,None,size=size,asize=asize)
+    elif rep == 'ppcm':
+        if not atom:
+            print ("ERROR: This representation requires atom symbols (example kwarg: atom=['C','H'])")
+            quit()
+        else:            
+            mod_nuc = [mod_z[elem] for elem in atom]
+            X = generate_pcm(mod_nuc,nuc,xyz,size=size,sorting=sort)
+            #X2 = generate_coulomb_matrix(nuc,xyz,size=size,sorting=sort)
+    elif rep == 'pcm':
+        if not atom:
+            print ("ERROR: This representation requires atom symbols (example kwarg: atom=['C','H'])")
+            quit()
+        else:            
+            nuc = [mod_z[elem] for elem in atom]
+            #X = generate_pcm(mod_nuc,nuc,xyz,size=size,sorting=sort)
+            X = generate_coulomb_matrix(nuc,xyz,size=size,sorting=sort)
+    elif rep == 'cmh':
+        if z_max==0.0:
+            print ("ERROR: cmh representation requires maximum atomic number info")
+            quit()
+        else:
+            quit()        
+    elif rep == 'fchl':
+        X = generate_representation(xyz,nuc,max_size=size,neighbors=neighbors)
+    else:
+        print("ERROR: Unknown representation type : %s" % rep)
+        quit()
+    return X
+
